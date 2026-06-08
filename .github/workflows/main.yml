@@ -1,9 +1,10 @@
-name: Backend Security Scan - SonarCloud, Snyk, Trivy
+name: Backend Security Scan - SonarCloud, Snyk, Trivy, ECR
 
 on:
   workflow_dispatch:
 
 permissions:
+  id-token: write
   contents: read
   security-events: write
   actions: read
@@ -11,20 +12,20 @@ permissions:
 env:
   IMAGE_NAME: devops-backend
   IMAGE_TAG: ${{ github.sha }}
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: devops/dso-project
 
 jobs:
   backend-security-scan:
-    name: Scan Backend Source, Dependencies, Dockerfile and Image
+    name: Scan Backend, Build Image and Push to ECR
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout backend repository
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2. Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -32,35 +33,29 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      # 3. Install backend dependencies
       - name: Install backend dependencies
         run: npm ci
 
-      # 4. SonarCloud source code scan
       - name: SonarCloud Scan
         uses: SonarSource/sonarqube-scan-action@v7
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-      # 5. Setup Snyk CLI
       - name: Setup Snyk
         uses: snyk/actions/setup@master
 
-      # 6. Snyk dependency scan
       - name: Snyk Open Source Dependency Scan
         continue-on-error: true
         run: snyk test --file=package.json --sarif-file-output=snyk-open-source.sarif
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-      
-      # 7. Send dependency scan result to Snyk Dashboard
+
       - name: Send Snyk Open Source Report to Snyk Dashboard
         continue-on-error: true
         run: snyk monitor --file=package.json --project-name=devops-backend
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      # 8. Upload Snyk dependency report to GitHub Security tab
       - name: Upload Snyk Dependency Report
         if: always() && hashFiles('snyk-open-source.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4
@@ -68,14 +63,12 @@ jobs:
           sarif_file: snyk-open-source.sarif
           category: snyk-open-source
 
-      # 9. Snyk Code scan
       - name: Snyk Code Scan
         continue-on-error: true
         run: snyk code test --sarif-file-output=snyk-code.sarif
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      # 10. Upload Snyk Code report
       - name: Upload Snyk Code Report
         if: always() && hashFiles('snyk-code.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4
@@ -83,8 +76,6 @@ jobs:
           sarif_file: snyk-code.sarif
           category: snyk-code
 
-      # 11. Trivy filesystem scan
-      # Scans package.json, package-lock.json, source files, secrets, etc.
       - name: Trivy Filesystem Scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -95,7 +86,6 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
 
-      # 12. Upload Trivy filesystem report
       - name: Upload Trivy Filesystem Report
         if: always() && hashFiles('trivy-fs.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4
@@ -103,8 +93,6 @@ jobs:
           sarif_file: trivy-fs.sarif
           category: trivy-filesystem
 
-      # 13. Trivy Dockerfile/config scan
-      # Scans Dockerfile and other config files
       - name: Trivy Dockerfile Config Scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -114,7 +102,6 @@ jobs:
           output: trivy-config.sarif
           severity: HIGH,CRITICAL
 
-      # 14. Upload Trivy config report
       - name: Upload Trivy Config Report
         if: always() && hashFiles('trivy-config.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4
@@ -122,11 +109,9 @@ jobs:
           sarif_file: trivy-config.sarif
           category: trivy-config
 
-      # 15. Build Docker image
       - name: Build Docker image
         run: docker build -t $IMAGE_NAME:$IMAGE_TAG .
 
-      # 16. Trivy Docker image scan
       - name: Trivy Docker Image Scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -137,7 +122,6 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
 
-      # 17. Upload Trivy image report
       - name: Upload Trivy Image Report
         if: always() && hashFiles('trivy-image.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4
@@ -145,11 +129,36 @@ jobs:
           sarif_file: trivy-image.sarif
           category: trivy-image
 
-      # 18. Upload all SARIF reports as workflow artifacts
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v6.1.0
+        with:
+          role-to-assume: arn:aws:iam::283372067875:role/dheeraj-github-backend
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag and Push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker tag $IMAGE_NAME:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_NAME-$IMAGE_TAG
+          docker tag $IMAGE_NAME:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:backend-latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_NAME-$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:backend-latest
+
       - name: Upload all security scan reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: backend-security-scan-reports
+          name: backend-security-reports
           path: |
-            *.sarif
+            snyk-open-source.sarif
+            snyk-code.sarif
+            trivy-fs.sarif
+            trivy-config.sarif
+            trivy-image.sarif
